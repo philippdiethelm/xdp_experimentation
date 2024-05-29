@@ -3,6 +3,8 @@
 // Licensed under the MIT License.
 //
 
+#include <iostream>
+
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +13,7 @@
 
 #pragma comment(lib, "xdpapi.lib")
 
-extern void JoinGroupOnAllInterfaces(const char* group_address = "224.0.0.200");
+extern void JoinMulticastGroupOnAllInterfaces(const char* group_address = "224.0.0.200");
 
 
 const CHAR* UsageText =
@@ -36,7 +38,7 @@ const XDP_HOOK_ID XdpInspectRxL2 = {
 static UINT16 htons(UINT16 value)
 {
     UINT16 result = ((value & 0xff00) >> 8) | ((value & 0xff) << 8);
-    //LOGERR("htons: %04x -> %04x", value, result);
+    // LOGERR("htons: %04x -> %04x", value, result);
     return result;
 }
 
@@ -48,11 +50,9 @@ static void TranslateRxToTx(_Inout_ UCHAR* Frame, _In_ UINT32 Length)
     if (Length > 42) {
         UINT16 srcPort;
         UINT16 dstPort;
-        memcpy(&srcPort, &Frame[34], 2); 
-        memcpy(&dstPort, &Frame[36], 2); 
-        LOGERR(
-            "Length: %u: SrcPort: %04x, DstPort: %04x",
-            Length, htons(srcPort), htons(dstPort));
+        memcpy(&srcPort, &Frame[34], 2);
+        memcpy(&dstPort, &Frame[36], 2);
+        LOGERR("Length: %u: SrcPort: %04x, DstPort: %04x", Length, htons(srcPort), htons(dstPort));
     }
 
     memset(Frame, 0, Length);
@@ -60,26 +60,17 @@ static void TranslateRxToTx(_Inout_ UCHAR* Frame, _In_ UINT32 Length)
 
 int main(int argc, char** argv)
 {
-    const XDP_API_TABLE* XdpApi;
-    HANDLE Socket;
-    HANDLE Program;
-    UINT32 IfIndex;
-    XSK_RING_INFO_SET RingInfo;
-    UINT32 OptionLength;
-    XSK_RING RxRing;
-    XSK_RING RxFillRing;
-    UINT32 RingIndex;
-
     if (argc < 2) {
         fprintf(stderr, UsageText);
         return EXIT_FAILURE;
     }
 
-    IfIndex = atoi(argv[1]);
+    UINT32 IfIndex = atoi(argv[1]);
 
     //
     // Retrieve the XDP API dispatch table.
     //
+    const XDP_API_TABLE* XdpApi;
     if (auto Result = XdpOpenApi(XDP_API_VERSION_1, &XdpApi); FAILED(Result)) {
         LOGERR("XdpOpenApi failed: %x", Result);
         return EXIT_FAILURE;
@@ -88,27 +79,30 @@ int main(int argc, char** argv)
     //
     // Create an AF_XDP socket. The newly created socket is not connected.
     //
+    HANDLE Socket;
     if (auto Result = XdpApi->XskCreate(&Socket); FAILED(Result)) {
         LOGERR("XskCreate failed: %x", Result);
         return EXIT_FAILURE;
     }
 
     //
-    // Register our frame buffer(s) with the AF_XDP socket. For simplicity, we
-    // register a buffer containing a single frame. The registered buffer is
+    // Register our frame buffer(s) with the AF_XDP socket. The registered buffer is
     // available mapped into AF_XDP's address space, and elements of descriptor
-    // rings refer to relative offets from the start of the UMEM.
+    // rings refer to relative offsets from the start of the UMEM.
     //
-    DWORD FrameSize = 16 * 1024;
-    LPVOID Frame = VirtualAlloc(NULL, FrameSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    DWORD NumChunks = 16;
+    DWORD ChunkSize = 16384;
+    DWORD TotalSize = NumChunks * ChunkSize;
+    LPVOID Frame = VirtualAlloc(NULL, TotalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
     if (Frame == nullptr) {
         LOGERR("VirtualAlloc failed!");
         return EXIT_FAILURE;
     }
 
     XSK_UMEM_REG UmemReg {
-        .TotalSize = FrameSize,
-        .ChunkSize = FrameSize,
+        .TotalSize = TotalSize,
+        .ChunkSize = ChunkSize,
         .Address = Frame,
     };
     if (auto Result = XdpApi->XskSetSockopt(Socket, XSK_SOCKOPT_UMEM_REG, &UmemReg, sizeof(UmemReg)); FAILED(Result)) {
@@ -126,13 +120,12 @@ int main(int argc, char** argv)
     }
 
     //
-    // Request a set of RX, RX fill, TX, and TX completion descriptor rings.
-    // Request a capacity of one frame in each ring for simplicity. XDP will
-    // create the rings and map them into the process address space as part of
-    // the XskActivate step further below.
+    // Request a set of RX and RX fill descriptor rings.
+    // XDP will create the rings and map them into the process address space as part
+    // of the XskActivate step further below.
     //
 
-    UINT32 RingSize = 1;
+    UINT32 RingSize = NumChunks;
     if (auto Result = XdpApi->XskSetSockopt(Socket, XSK_SOCKOPT_RX_RING_SIZE, &RingSize, sizeof(RingSize));
         FAILED(Result)) {
         LOGERR("XSK_SOCKOPT_RX_RING_SIZE failed: %x", Result);
@@ -147,7 +140,7 @@ int main(int argc, char** argv)
 
     //
     // Activate the AF_XDP socket. Once activated, descriptor rings are
-    // available and RX and TX can occur.
+    // available and RX can occur.
     //
     if (auto Result = XdpApi->XskActivate(Socket, XSK_ACTIVATE_FLAG_NONE); FAILED(Result)) {
         LOGERR("XskActivate failed: %x", Result);
@@ -157,7 +150,8 @@ int main(int argc, char** argv)
     //
     // Retrieve the RX, RX fill, TX, and TX completion ring info from AF_XDP.
     //
-    OptionLength = sizeof(RingInfo);
+    XSK_RING_INFO_SET RingInfo;
+    UINT32 OptionLength = sizeof(RingInfo);
     if (auto Result = XdpApi->XskGetSockopt(Socket, XSK_SOCKOPT_RING_INFO, &RingInfo, &OptionLength); FAILED(Result)) {
         LOGERR("XSK_SOCKOPT_RING_INFO failed: %x", Result);
         return EXIT_FAILURE;
@@ -167,6 +161,8 @@ int main(int argc, char** argv)
     // Initialize the optional AF_XDP helper library with the socket ring info.
     // These helpers simplify manipulation of the shared rings.
     //
+    XSK_RING RxRing;
+    XSK_RING RxFillRing;
     XskRingInitialize(&RxRing, &RingInfo.Rx);
     XskRingInitialize(&RxFillRing, &RingInfo.Fill);
 
@@ -176,43 +172,54 @@ int main(int argc, char** argv)
     // frame descriptor from the RX fill ring and copy the frame payload into
     // that descriptor's buffer.
     //
-    XskRingProducerReserve(&RxFillRing, 1, &RingIndex);
+    UINT32 StartRingIndex;
+    if (XskRingProducerReserve(&RxFillRing, NumChunks, &StartRingIndex) != NumChunks) {
+        LOGERR("XskRingProducerReserve failed to get all descriptors");
+        return EXIT_FAILURE;
+    }
 
-    //
-    // The value of each RX fill and TX completion ring element is an offset
-    // from the start of the UMEM to the start of the frame. Since this sample
-    // is using a single buffer, the offset is always zero.
-    //
-    *(UINT32*)XskRingGetElement(&RxFillRing, RingIndex) = 0;
+    for (DWORD i = 0; i < NumChunks; i++) {
+        //
+        // The value of each RX fill and TX completion ring element is an offset
+        // from the start of the UMEM to the start of the frame. Since this sample
+        // is using a single buffer, the offset is always zero.
+        //
+        *(UINT32*)XskRingGetElement(&RxFillRing, StartRingIndex + i) = i * ChunkSize;
+        std::cout << "RingIndex + " << i << ": " << i * ChunkSize << std::endl;
+    }
 
-    XskRingProducerSubmit(&RxFillRing, 1);
+    XskRingProducerSubmit(&RxFillRing, NumChunks);
 
     //
     // Create an XDP program using the parsed rule at the L2 inspect hook point.
-    // The rule intercepts all UDP frames destined to local port 1234 and
+    // The rule intercepts all UDP frames destined to local port Pattern.Port and
     // redirects them to the AF_XDP socket.
     //
-    XDP_RULE Rule
-    {
-        .Match = XDP_MATCH_UDP,
-        .Pattern = {
-            .Port = htons(0x4322),
-        },
-        .Action = XDP_PROGRAM_ACTION_REDIRECT,
-        .Redirect = {
-            .TargetType = XDP_REDIRECT_TARGET_TYPE_XSK,
-            .Target = Socket,
+    XDP_RULE Rule[] {
+        {
+            .Match = XDP_MATCH_UDP, // XDP_MATCH_UDP_DST
+            .Pattern =
+                {
+                    .Port = htons(0x4321),
+                },
+            .Action = XDP_PROGRAM_ACTION_REDIRECT,
+            .Redirect =
+                {
+                    .TargetType = XDP_REDIRECT_TARGET_TYPE_XSK,
+                    .Target = Socket,
+                },
         },
     };
 
-    if (auto Result =
-            XdpApi->XdpCreateProgram(IfIndex, &XdpInspectRxL2, 0, XDP_CREATE_PROGRAM_FLAG_NONE, &Rule, 1, &Program);
+    HANDLE Program;
+    if (auto Result = XdpApi->XdpCreateProgram(
+            IfIndex, &XdpInspectRxL2, 0, XDP_CREATE_PROGRAM_FLAG_ALL_QUEUES, &Rule[0], (DWORD)std::size(Rule), &Program);
         FAILED(Result)) {
         LOGERR("XdpCreateProgram failed: %x", Result);
         return EXIT_FAILURE;
     }
 
-    JoinGroupOnAllInterfaces();
+    JoinMulticastGroupOnAllInterfaces();
 
     //
     // Continuously scan the RX ring and TX completion ring for new descriptors.
@@ -221,19 +228,20 @@ int main(int argc, char** argv)
     // frames across each XskRing* function.
     //
     while (TRUE) {
-        if (XskRingConsumerReserve(&RxRing, 1, &RingIndex) == 1) {
+        if (XskRingConsumerReserve(&RxRing, 1, &StartRingIndex) == 1) {
             XSK_BUFFER_DESCRIPTOR* RxBuffer;
 
             //
             // A new RX frame appeared on the RX ring. Forward it to the TX
             // ring.
 
-            RxBuffer = (XSK_BUFFER_DESCRIPTOR*)XskRingGetElement(&RxRing, RingIndex);
+            RxBuffer = (XSK_BUFFER_DESCRIPTOR*)XskRingGetElement(&RxRing, StartRingIndex);
 
             //
             // Swap source and destination fields within the frame payload.
             //
             UCHAR* pFrame = (UCHAR*)Frame;
+            std::cout << "AddressAndOffset: " << *(UINT32*)(RxBuffer) << std::endl;
             TranslateRxToTx(&pFrame[RxBuffer->Address.AddressAndOffset], RxBuffer->Length);
 
             //
@@ -247,9 +255,13 @@ int main(int argc, char** argv)
             // Reserve space in the RX fill ring. Since we're only using one
             // frame in this sample, space is guaranteed to be available.
             //
-            XskRingProducerReserve(&RxFillRing, 1, &RingIndex);
-            *(UINT32*)XskRingGetElement(&RxFillRing, RingIndex) = 0;
+            XskRingProducerReserve(&RxFillRing, 1, &StartRingIndex);
+            *(UINT32*)XskRingGetElement(&RxFillRing, StartRingIndex) = *(UINT32*)RxBuffer;
             XskRingProducerSubmit(&RxFillRing, 1);
+
+            static DWORD counter = 0;
+            if (counter++ > NumChunks)
+                break;
         }
     }
 

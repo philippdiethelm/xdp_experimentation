@@ -85,7 +85,7 @@ class WinsockHelper {
 
 static WinsockHelper helper;
 
-void JoinGroupOnAllInterfaces(const char* group_address = "224.0.0.200")
+void JoinMulticastGroupOnAllInterfaces(const char* group_address = "224.0.0.200")
 {
     auto temp_socket = WSASocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, 0);
 
@@ -99,8 +99,6 @@ void JoinGroupOnAllInterfaces(const char* group_address = "224.0.0.200")
     DWORD interface_list_size = interface_list_entries * sizeof(INTERFACE_INFO);
     ULONG bytes_returned = 0;
 
-    std::cout << "JoinGroupOnAllInterfaces() START" << std::endl;
-
     if (auto status = WSAIoctl(
             temp_socket, SIO_GET_INTERFACE_LIST, 0, 0, &interface_list[0], interface_list_size, &bytes_returned, 0, 0);
         status != NO_ERROR) {
@@ -113,8 +111,21 @@ void JoinGroupOnAllInterfaces(const char* group_address = "224.0.0.200")
     const int enable = 1;
 
     if (auto result = setsockopt(temp_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&enable, sizeof(enable));
-        result < 0)
+        result < 0) {
         throw "setsockopt(SO_REUSEADDR) failed!";
+    }
+
+#if 0
+    sockaddr_in bind_addr {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr = {.S_un = {.S_addr = htonl(INADDR_ANY)}},
+    };
+
+    if (SOCKET_ERROR == bind(temp_socket, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr))) {
+        throw std::format("bind failed with error: {}", WSAGetLastError());
+    }
+#endif
 
     int joined_successfully = 0;
     for (int i = 0; i < bytes_returned / sizeof(INTERFACE_INFO); ++i) {
